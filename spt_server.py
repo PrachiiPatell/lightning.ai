@@ -4,8 +4,24 @@ import numpy as np, torch, laspy
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-sys.path.insert(0, "/teamspace/studios/this_studio/superpoint_transformer")
-os.chdir("/teamspace/studios/this_studio/superpoint_transformer")
+# Locate the superpoint_transformer checkout. 03_install_spt.sh clones it into
+# the Lightning Studio workspace when present and into $HOME otherwise (e.g. on
+# a plain EC2 box), so resolve at run time instead of hardcoding one host's
+# layout. Override with SPT_ROOT=/path/to/superpoint_transformer.
+_SPT_ROOT = os.environ.get("SPT_ROOT") or next(
+    (p for p in (
+        "/teamspace/studios/this_studio/superpoint_transformer",
+        os.path.expanduser("~/superpoint_transformer"),
+    ) if os.path.isdir(p)),
+    None,
+)
+if not _SPT_ROOT:
+    sys.exit(
+        "superpoint_transformer checkout not found. Run 03_install_spt.sh first, "
+        "or set SPT_ROOT to the checkout path."
+    )
+sys.path.insert(0, _SPT_ROOT)
+os.chdir(_SPT_ROOT)
 torch.backends.cuda.preferred_linalg_library("magma")
 
 from omegaconf import OmegaConf
