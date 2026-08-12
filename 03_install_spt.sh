@@ -99,7 +99,12 @@ done
 
 SKIP_FRNN=0
 if [ -z "$CUDA_MATCH" ]; then
-  _sys="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p')"
+  # `|| true` is required, not cosmetic: under `set -o pipefail` this pipeline
+  # returns non-zero when nvcc is absent (the normal case on a plain Ubuntu AMI
+  # with only the driver installed), and `set -e` then aborts the script with no
+  # message at all -- killing the run right before the pip fallback that exists
+  # precisely to handle a missing toolkit.
+  _sys="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' || true)"
   warn "No CUDA ${TORCH_CUDA_MAJOR}.x toolkit found (system nvcc reports ${_sys:-none})."
   warn "FRNN is NOT optional: src/utils/neighbors.py does"
   warn "  'from src.dependencies.FRNN import frnn'"
