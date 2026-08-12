@@ -289,3 +289,16 @@ def predict(req: AiAssistRequest):
         "pending_cuboids": pending_cuboids,
         "class_counts": class_counts,
     }
+
+
+if __name__ == "__main__":
+    # Allow `python spt_server.py` as well as `uvicorn spt_server:app ...`.
+    # The systemd unit in DEPLOY_EC2.md invokes the module directly, and
+    # without this the process would load the model, define `app`, then exit
+    # immediately -- systemd would read that as a crash-loop.
+    import uvicorn
+    uvicorn.run(
+        app,
+        host=os.environ.get("SPT_HOST", "0.0.0.0"),
+        port=int(os.environ.get("SPT_PORT", "8000")),
+    )
