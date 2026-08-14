@@ -188,8 +188,37 @@ def predict(req: AiAssistRequest):
             centroid = xyz_all.mean(axis=0)
             print(f"[READ] {n:,} pts, rgb={_has_rgb}, {time.time()-t:.1f}s", flush=True)
 
-            # 3. Subsample for SPT inference
-            MAX_PTS = 1_500_000
+            # 3. Drop vertical outliers BEFORE subsampling.
+            #
+            # SPT's preprocessing fits a ground plane with RANSAC
+            # (src/utils/ground.py). A handful of stray returns far below the
+            # terrain skew that fit badly enough that it finds no plane at all
+            # and returns None -- which the library then dereferences, crashing
+            # the request with a 500. One real 1 km tile had p0=12.1 m against
+            # p1=65.5 m: a 53 m gap made of noise.
+            #
+            # Clip to the 0.5-99.5 percentile band. That removes the stragglers
+            # while keeping every real surface, since genuine terrain relief is
+            # continuous rather than a lone spike.
+            _zlo, _zhi = np.percentile(xyz_all[:, 2], [0.5, 99.5])
+            _keep = (xyz_all[:, 2] >= _zlo) & (xyz_all[:, 2] <= _zhi)
+            _dropped = int(n - _keep.sum())
+            if _dropped:
+                xyz_all = xyz_all[_keep]
+                intensity_all = intensity_all[_keep]
+                if rgb_all is not None:
+                    rgb_all = rgb_all[_keep]
+                n = len(xyz_all)
+                centroid = xyz_all.mean(axis=0)
+                print(f"[CLIP] dropped {_dropped:,} z-outliers "
+                      f"(kept {_zlo:.1f}..{_zhi:.1f} m), {n:,} pts left", flush=True)
+
+            # 4. Subsample for SPT inference.
+            #
+            # Raised from 1.5M: an 80M-point 1 km tile subsampled to 1.5M leaves
+            # ~1.5 pts/m2, too sparse for the ground fit to lock on. The L4 has
+            # 23 GB VRAM and handles 4M comfortably.
+            MAX_PTS = int(os.environ.get("SPT_MAX_PTS", "4000000"))
             if n > MAX_PTS:
                 idx = np.random.default_rng(42).choice(n, MAX_PTS, replace=False)
                 idx.sort()
@@ -203,7 +232,22 @@ def predict(req: AiAssistRequest):
             data = Data()
             data.pos = torch.from_numpy(pos)
             data.intensity = torch.from_numpy(np.clip(intensity, 0, 60000) / 60000).unsqueeze(-1)
-            nag = PRE_T(data)
+            # SPT's ground-plane RANSAC returns None when it cannot fit a plane,
+            # and src/utils/ground.py dereferences that without checking
+            # ("TypeError: 'NoneType' object is not subscriptable"). Translate
+            # it into an answer the caller can act on instead of a bare 500.
+            try:
+                nag = PRE_T(data)
+            except TypeError as _e:
+                if "NoneType" in str(_e):
+                    raise HTTPException(
+                        422,
+                        "Could not detect a ground plane in this cloud. SPT-DALES "
+                        "expects an aerial survey with visible terrain; a scan "
+                        "that is very sparse, very steep, or has no ground "
+                        "returns will fail here.",
+                    )
+                raise
             nag = TEST_T(nag.to("cuda"))
             with torch.no_grad():
                 _, output = MODEL.predict_step(nag, batch_idx=0)
