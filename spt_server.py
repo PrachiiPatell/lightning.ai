@@ -266,10 +266,25 @@ def predict(req: AiAssistRequest):
             per_point = voxel_preds[nn].astype(np.int32)
             print(f"[NN] {time.time()-t:.1f}s", flush=True)
 
-            # 6. Semantic overlay — PER-POINT: every point read from the LAS gets
-            # its predicted class, no subsampling. Coords rounded to cm and the
-            # response is gzipped, so a full 2-3M-point overlay stays manageable.
-            keep = np.arange(len(xyz_all))
+            # 6. Semantic overlay.
+            #
+            # Capped, NOT per-point. Sending every point meant ~127 MB of
+            # JSON (~25 MB gzipped) for a 2.1M-point tile: Django parses it,
+            # re-encodes it, ships it, and the browser parses it again --
+            # none of which is visible in this log, which is why inference
+            # looked fast while the overlay took far longer to appear.
+            #
+            # 500k matches what JLabel PERSISTS anyway (_persist_ai_overlay
+            # downsamples to the same target), so the extra points were
+            # discarded on the first save regardless -- they only ever cost
+            # transfer time. Override with SPT_OVERLAY_MAX_PTS.
+            _ov_cap = int(os.environ.get("SPT_OVERLAY_MAX_PTS", "500000"))
+            _n_all = len(xyz_all)
+            if _n_all > _ov_cap:
+                _step = int(np.ceil(_n_all / _ov_cap))
+                keep = np.arange(0, _n_all, _step)
+            else:
+                keep = np.arange(_n_all)
             ov_pos = np.round(xyz_all[keep] - centroid, 2)
             # Vectorized DALES->JLabel class map (fast for millions of points).
             _dales_map = np.array(
@@ -279,7 +294,8 @@ def predict(req: AiAssistRequest):
             ov_cls = _dales_map[per_point[keep]]
             ov_rgb = rgb_all[keep] if rgb_all is not None else None
 
-            print(f"[OVERLAY] per-point: {len(keep):,} pts, rgb={ov_rgb is not None}", flush=True)
+            print(f"[OVERLAY] {len(keep):,} of {_n_all:,} pts "
+                  f"(cap {_ov_cap:,}), rgb={ov_rgb is not None}", flush=True)
             _t_ser = time.time()
 
             # .tolist() builds tens of millions of Python objects and the
