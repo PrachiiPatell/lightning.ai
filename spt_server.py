@@ -280,7 +280,12 @@ def predict(req: AiAssistRequest):
             ov_rgb = rgb_all[keep] if rgb_all is not None else None
 
             print(f"[OVERLAY] per-point: {len(keep):,} pts, rgb={ov_rgb is not None}", flush=True)
+            _t_ser = time.time()
 
+            # .tolist() builds tens of millions of Python objects and the
+            # JSON encode that follows is comparable again -- measured at
+            # ~24s / 216 MB for 5M points. Logged so a slow request can be
+            # attributed to serialisation rather than blamed on the model.
             semantic_overlay = {
                 "positions": ov_pos.tolist(),
                 "classes": ov_cls.tolist(),
@@ -298,6 +303,9 @@ def predict(req: AiAssistRequest):
                     "Fences":      [0, 233, 11],
                 },
             }
+            print(f"[SERIALISE] {time.time()-_t_ser:.1f}s "
+                  f"({len(semantic_overlay['positions']):,} pts to Python lists)",
+                  flush=True)
 
             # 7. Extra classes + per-class point counts
             user_classes = list(req.class_colors.keys())
