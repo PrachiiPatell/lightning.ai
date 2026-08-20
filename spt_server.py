@@ -108,6 +108,127 @@ class AiAssistRequest(BaseModel):
         extra = "allow"
 
 
+# ---------------------------------------------------------------------------
+# PLY reading.
+#
+# SPT-DALES itself is format-agnostic -- everything past the read step is plain
+# numpy. Only laspy was, so .ply was rejected at the door even though JLabel
+# routes it here. These two functions are ported from JLabel's own PLY parser
+# (main/views.py) rather than adding a plyfile dependency: that parser is
+# already proven against the files real users upload, and a second independent
+# implementation could disagree with it on the same file.
+#
+# The result mimics just enough of a laspy object for the read step below:
+# .x/.y/.z, .intensity, and optional .red/.green/.blue.
+# ---------------------------------------------------------------------------
+_PLY_TYPE_MAP = {
+    'char': 'i1', 'int8': 'i1', 'uchar': 'u1', 'uint8': 'u1',
+    'short': 'i2', 'int16': 'i2', 'ushort': 'u2', 'uint16': 'u2',
+    'int': 'i4', 'int32': 'i4', 'uint': 'u4', 'uint32': 'u4',
+    'float': 'f4', 'float32': 'f4', 'double': 'f8', 'float64': 'f8',
+}
+
+
+class _PlyPoints:
+    """Duck-types the subset of a laspy object the read step touches."""
+    pass
+
+
+def _parse_ply_header(f):
+    """Read the ASCII header of a (possibly binary-body) PLY.
+
+    Returns (format, elements), elements being an ordered list of
+    {'name', 'count', 'props': [(np_dtype_str, prop_name), ...]}. Only
+    fixed-size properties are supported, which is correct for vertex data.
+    """
+    line = f.readline().decode('ascii').strip()
+    if line != 'ply':
+        raise ValueError('Not a PLY file')
+    fmt = None
+    elements = []
+    while True:
+        line = f.readline().decode('ascii').strip()
+        if line.startswith('format'):
+            fmt = line.split()[1]
+        elif line.startswith('element'):
+            _, name, count = line.split()
+            elements.append({'name': name, 'count': int(count), 'props': []})
+        elif line.startswith('property'):
+            parts = line.split()
+            if parts[1] == 'list':
+                raise ValueError(
+                    f'PLY list properties not supported (element: {elements[-1]["name"]})')
+            elements[-1]['props'].append((_PLY_TYPE_MAP[parts[1]], parts[2]))
+        elif line == 'end_header':
+            break
+        elif line == '':
+            raise ValueError('Unexpected EOF in PLY header')
+    return fmt, elements
+
+
+def _read_ply(path):
+    """Parse a PLY into a laspy-like object. Returns (obj, n_points)."""
+    with open(path, 'rb') as f:
+        fmt, elements = _parse_ply_header(f)
+        vertex_el = next((e for e in elements if e['name'] == 'vertex'), None)
+        if vertex_el is None:
+            raise ValueError('PLY has no vertex element')
+        names = [p[1] for p in vertex_el['props']]
+        for req in ('x', 'y', 'z'):
+            if req not in names:
+                raise ValueError(f'PLY vertex element missing "{req}" property')
+
+        if fmt == 'ascii':
+            # Elements listed before 'vertex' must be consumed line by line.
+            for el in elements:
+                if el is vertex_el:
+                    break
+                for _ in range(el['count']):
+                    f.readline()
+            cols = {n: [] for n in names}
+            for _ in range(vertex_el['count']):
+                vals = f.readline().decode('ascii').split()
+                for n, v in zip(names, vals):
+                    cols[n].append(float(v))
+            arrs = {n: np.asarray(v, dtype=np.float32) for n, v in cols.items()}
+        else:
+            endian = '<' if fmt == 'binary_little_endian' else '>'
+            body_offset = 0
+            for el in elements:
+                if el is vertex_el:
+                    break
+                dt = np.dtype([(n, endian + t) for t, n in el['props']])
+                body_offset += dt.itemsize * el['count']
+            dt = np.dtype([(n, endian + t) for t, n in vertex_el['props']])
+            f.seek(body_offset, 1)   # relative: we are just past end_header
+            raw = f.read(dt.itemsize * vertex_el['count'])
+            struct_arr = np.frombuffer(raw, dtype=dt)
+            arrs = {n: np.asarray(struct_arr[n], dtype=np.float32) for n in names}
+
+    n = len(arrs['x'])
+    obj = _PlyPoints()
+    obj.x, obj.y, obj.z = arrs['x'], arrs['y'], arrs['z']
+
+    # Intensity: PLY rarely carries it. DALES trained WITH intensity, so a
+    # constant fill is a real information loss -- expect somewhat weaker
+    # labels on PLY than on LAS. Accept the common spellings before falling
+    # back. The fill is 1.0, not 0.0, to match the neutral value the LAS path
+    # produces for files whose intensity dimension is present but unwritten.
+    for _cand in ('intensity', 'scalar_Intensity', 'scalar_intensity'):
+        if _cand in arrs:
+            obj.intensity = arrs[_cand]
+            break
+    else:
+        obj.intensity = np.ones(n, dtype=np.float32)
+
+    # PLY colour is uchar 0-255 already. The LAS path divides by 257 when it
+    # sees values above 255 (16-bit LAS colour); leaving these 8-bit means
+    # that branch correctly does nothing.
+    if all(c in arrs for c in ('red', 'green', 'blue')):
+        obj.red, obj.green, obj.blue = arrs['red'], arrs['green'], arrs['blue']
+    return obj, n
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "model": "SPT-DALES"}
@@ -117,8 +238,8 @@ def health():
 def predict(req: AiAssistRequest):
     t0 = time.time()
     ext = os.path.splitext(req.lidar_file_url.split("?")[0])[1].lower()
-    if ext not in (".las", ".laz"):
-        raise HTTPException(400, f"SPT-DALES only supports .las/.laz, got {ext}")
+    if ext not in (".las", ".laz", ".ply"):
+        raise HTTPException(400, f"SPT-DALES only supports .las/.laz/.ply, got {ext}")
     print(f"[REQ] {req.lidar_file_url[:80]}", flush=True)
 
     with inference_lock:
@@ -145,13 +266,19 @@ def predict(req: AiAssistRequest):
             # 2. Read LAS as float32 with a hard memory cap
             t = time.time()
             HARD_CAP = 3_000_000
-            with laspy.open(tmp_path) as _f:
-                _n_total = _f.header.point_count
-            las = laspy.read(tmp_path)
-            # Original per-point RGB — powers single-cloud erase/hide in JLabel
-            # (erased points repaint to their true colour in place).
-            _dims = set(las.point_format.dimension_names)
-            _has_rgb = {'red', 'green', 'blue'} <= _dims
+            if ext == ".ply":
+                # No cheap header-only count: the PLY parser reads the whole
+                # vertex block in one pass, so the count comes back with it.
+                las, _n_total = _read_ply(tmp_path)
+                _has_rgb = all(hasattr(las, c) for c in ('red', 'green', 'blue'))
+            else:
+                with laspy.open(tmp_path) as _f:
+                    _n_total = _f.header.point_count
+                las = laspy.read(tmp_path)
+                # Original per-point RGB — powers single-cloud erase/hide in
+                # JLabel (erased points repaint to their true colour in place).
+                _dims = set(las.point_format.dimension_names)
+                _has_rgb = {'red', 'green', 'blue'} <= _dims
             if _n_total > HARD_CAP:
                 _sel = np.random.default_rng(42).choice(_n_total, HARD_CAP, replace=False)
                 _sel.sort()
