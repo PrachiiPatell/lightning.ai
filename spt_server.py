@@ -200,7 +200,23 @@ def predict(req: AiAssistRequest):
             # Clip to the 0.5-99.5 percentile band. That removes the stragglers
             # while keeping every real surface, since genuine terrain relief is
             # continuous rather than a lone spike.
-            _zlo, _zhi = np.percentile(xyz_all[:, 2], [0.5, 99.5])
+            # Percentiles were the wrong tool. On a dense urban tile most
+            # points sit near ground level, so the 99.5th percentile lands
+            # BELOW the rooftops: one real tile kept only 5.9-24.9 m out of
+            # a 72 m scene, discarding every building top and treetop before
+            # inference. The overlay then covered a thin slab and only ~25%
+            # of points ended up classified on export.
+            #
+            # Clip by ABSOLUTE distance from the median instead. Genuine
+            # structure lies within tens of metres of the ground; the noise
+            # this guards against sat ~53 m below it. A generous band keeps
+            # all real geometry while still cutting the stragglers that make
+            # the ground-plane RANSAC fail.
+            _zmed = float(np.median(xyz_all[:, 2]))
+            _zmad = float(np.median(np.abs(xyz_all[:, 2] - _zmed))) or 1.0
+            # 40 MADs is very wide -- it is a noise gate, not a crop.
+            _band = max(40.0 * _zmad, 150.0)
+            _zlo, _zhi = _zmed - _band, _zmed + _band
             _keep = (xyz_all[:, 2] >= _zlo) & (xyz_all[:, 2] <= _zhi)
             _dropped = int(n - _keep.sum())
             if _dropped:
