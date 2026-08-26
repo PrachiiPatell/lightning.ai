@@ -424,8 +424,19 @@ def predict(req: AiAssistRequest):
             _ov_cap = int(os.environ.get("SPT_OVERLAY_MAX_PTS", "500000"))
             _n_all = len(xyz_all)
             if _n_all > _ov_cap:
-                _step = int(np.ceil(_n_all / _ov_cap))
-                keep = np.arange(0, _n_all, _step)
+                # RANDOM sample rather than every Nth point.
+                #
+                # np.arange(0, n, step) selects by position in the array, which
+                # here follows the order the LAS file stored the points -- i.e.
+                # acquisition order. That makes the returned subset depend on
+                # the scan pattern rather than on the scene, and it changes
+                # entirely with the step size, so raising the cap silently
+                # swapped which points the client saw.
+                #
+                # Sorted afterwards so the payload keeps its spatial locality
+                # (and gzip ratio). Seeded for reproducibility.
+                keep = np.sort(np.random.default_rng(12345).choice(
+                    _n_all, size=_ov_cap, replace=False))
             else:
                 keep = np.arange(_n_all)
             ov_pos = np.round(xyz_all[keep] - centroid, 2)
