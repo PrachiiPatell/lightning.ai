@@ -484,6 +484,23 @@ def predict(req: AiAssistRequest):
             class_counts = {}
             detected_dales = set(int(c) for c in np.unique(per_point))
             print(f"[EXTRAS] detected DALES classes: {sorted(detected_dales)}", flush=True)
+            # Per-class counts on the INFERRED points and on the OVERLAY that
+            # is actually returned. If ground is plentiful here but scarce in
+            # the export, the loss is downstream (persist cap / propagation),
+            # not the model.
+            _tot = len(per_point)
+            _bits = []
+            for _c in sorted(detected_dales):
+                _n = int((per_point == _c).sum())
+                _bits.append(f"{DALES_NAMES[_c]}={_n:,}({_n/_tot*100:.1f}%)")
+            print("[COUNTS] inferred: " + "  ".join(_bits), flush=True)
+            _ovtot = len(ov_cls)
+            _ob = []
+            for _c in sorted(detected_dales):
+                _jl = DALES_TO_JLABEL_SEM[_c]
+                _n = int((ov_cls == _jl).sum())
+                _ob.append(f"{DALES_NAMES[_c]}={_n:,}({_n/_ovtot*100:.1f}%)")
+            print("[COUNTS] overlay : " + "  ".join(_ob), flush=True)
             for dales_idx in detected_dales:
                 if not (0 <= dales_idx < len(DALES_NAMES)):
                     continue
