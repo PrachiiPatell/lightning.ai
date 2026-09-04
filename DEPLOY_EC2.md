@@ -158,5 +158,34 @@ curl -X POST http://localhost:8000/predict \
 ```
 
 The server rejects anything that is not `.las`/`.laz` (`spt_server.py:105`), so
-test with an aerial LAS — the file type SPT-DALES was trained on. It has a
-3M-point hard cap (`:131`); larger clouds are subsampled.
+test with an aerial LAS — the file type SPT-DALES was trained on.
+
+## The two point caps
+
+They bound different resources and are set independently. Both are env vars,
+so they can be changed on the service without a rebuild:
+
+| var | default | bounds | governs |
+|---|---|---|---|
+| `SPT_MAX_PTS` | 4,000,000 | GPU VRAM | how many points the model SEES — prediction quality |
+| `SPT_HARD_CAP` | 20,000,000 | host RAM | how many points get LABELLED — output resolution |
+
+They are independent: SPT predicts on superpoints, which are projected to
+voxels, and points are then labelled by a KDTree query against those voxels.
+That query does not care how many points the model saw, so inference can run
+on 4M while all 12.5M points still get a label.
+
+`SPT_HARD_CAP` was previously hardcoded at 3M, below `SPT_MAX_PTS`. That made
+the inference subsample dead code AND capped output at 3M — a 12.5M-point tile
+came back at 9.3 pts/m² against the ~50 pts/m² the model trains on.
+
+To override, add to the systemd unit's `[Service]` block and
+`daemon-reload; restart`:
+
+```
+Environment=SPT_MAX_PTS=4000000
+Environment=SPT_HARD_CAP=20000000
+```
+
+**4M inference has never actually run on this hardware** — the old 3M read cap
+meant that path was unreachable. Watch `nvidia-smi` on the first request.
