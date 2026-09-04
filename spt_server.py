@@ -263,9 +263,50 @@ def predict(req: AiAssistRequest):
         print(f"[DL] done in {time.time()-t0:.1f}s", flush=True)
 
         try:
-            # 2. Read LAS as float32 with a hard memory cap
+            # 2. Read LAS as float32, bounded by SPT_HARD_CAP.
+            #
+            # There are TWO caps in this handler and they bound different
+            # resources for different reasons. Keep them separate:
+            #
+            #   SPT_MAX_PTS   how many points the MODEL sees (step 4).
+            #                 Bounded by VRAM. Governs prediction QUALITY.
+            #   SPT_HARD_CAP  how many points get LABELLED and returned (here).
+            #                 Bounded by host RAM. Governs output RESOLUTION.
+            #
+            # They are decoupled, which is easy to miss: SPT predicts on
+            # superpoints, those are projected to voxels, and step 5 then
+            # labels points with a KDTree lookup against the voxel positions.
+            # That lookup does not care how many points the model saw -- so we
+            # can infer on 4M and still label all 20M. Sending more points to
+            # the GPU is expensive; labelling more points is a KDTree query and
+            # some RAM.
+            #
+            # This cap does NOT protect the read itself. laspy.read() below
+            # loads the whole file before we get here, so that peak is paid
+            # either way; what the cap bounds is the arrays we RETAIN (xyz,
+            # intensity, rgb) and the size of the step 5 query. At float32 that
+            # is ~19 bytes/point retained after rgb is packed to uint8, so a
+            # 12.5M-point tile costs ~240 MB and the 20M ceiling ~380 MB. The
+            # ceiling exists for the pathological upload -- an 80M-point 1 km
+            # tile would retain ~1.5 GB on top of laspy's own read -- not for
+            # ordinary tiles, which should never hit it.
+            #
+            # Previously this was hardcoded at 3M while SPT_MAX_PTS was 4M,
+            # which had two bad effects. It silently made the step 4 subsample
+            # dead code (`n` was already <= 3M, so `n > MAX_PTS` never fired,
+            # and the documented 1.5M -> 4M raise never took effect). And it
+            # capped OUTPUT resolution at 3M for no gain: a 12.5M-point
+            # DALES-sized tile came back labelled at 9.3 pts/m2 against the
+            # ~50 pts/m2 the model trains on, having discarded 76% of the
+            # points to save ~180 MB.
+            #
+            # The max() is a guard against that first failure returning by
+            # misconfiguration, not a coupling -- HARD_CAP should normally sit
+            # far ABOVE MAX_PTS, not equal to it.
             t = time.time()
-            HARD_CAP = 3_000_000
+            MAX_PTS = int(os.environ.get("SPT_MAX_PTS", "4000000"))
+            HARD_CAP = max(int(os.environ.get("SPT_HARD_CAP", "20000000")),
+                           MAX_PTS)
             if ext == ".ply":
                 # No cheap header-only count: the PLY parser reads the whole
                 # vertex block in one pass, so the count comes back with it.
@@ -293,8 +334,6 @@ def predict(req: AiAssistRequest):
                     np.asarray(las.green, dtype=np.float32)[_sel],
                     np.asarray(las.blue, dtype=np.float32)[_sel],
                 ], axis=-1) if _has_rgb else None
-                del las
-                import gc; gc.collect()
             else:
                 xyz_all = np.stack([
                     np.asarray(las.x, dtype=np.float32),
@@ -307,6 +346,18 @@ def predict(req: AiAssistRequest):
                     np.asarray(las.green, dtype=np.float32),
                     np.asarray(las.blue, dtype=np.float32),
                 ], axis=-1) if _has_rgb else None
+            # Free the laspy object on BOTH paths. It is not referenced again,
+            # and everything below works off xyz_all/intensity_all/rgb_all.
+            #
+            # This used to sit inside the capped branch only, which was
+            # survivable while the cap was 3M (nearly every real file took that
+            # branch). With the ceiling at 20M almost everything takes the
+            # uncapped branch instead, so leaving it there would keep the full
+            # laspy object alive alongside our own arrays for the whole
+            # request -- roughly doubling the read's footprint at exactly the
+            # sizes the higher ceiling is meant to let through.
+            del las
+            import gc; gc.collect()
             if rgb_all is not None:
                 if rgb_all.max() > 255:      # LAS colour is usually 16-bit
                     rgb_all = rgb_all / 257.0
@@ -361,7 +412,11 @@ def predict(req: AiAssistRequest):
             # Raised from 1.5M: an 80M-point 1 km tile subsampled to 1.5M leaves
             # ~1.5 pts/m2, too sparse for the ground fit to lock on. The L4 has
             # 23 GB VRAM and handles 4M comfortably.
-            MAX_PTS = int(os.environ.get("SPT_MAX_PTS", "4000000"))
+            #
+            # MAX_PTS is read in step 2, where HARD_CAP is clamped to be at
+            # least this value. Do NOT re-read it here: the read cap is applied
+            # first, so the two have to be decided together or this branch goes
+            # dead (see the note there).
             if n > MAX_PTS:
                 idx = np.random.default_rng(42).choice(n, MAX_PTS, replace=False)
                 idx.sort()
