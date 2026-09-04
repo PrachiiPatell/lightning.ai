@@ -1,5 +1,5 @@
 """SPT-DALES inference server matching JLabel's /predict contract."""
-import os, sys, time, tempfile, threading, urllib.request
+import os, sys, time, base64, tempfile, threading, urllib.request
 import numpy as np, torch, laspy
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -334,6 +334,10 @@ def predict(req: AiAssistRequest):
                     np.asarray(las.green, dtype=np.float32)[_sel],
                     np.asarray(las.blue, dtype=np.float32)[_sel],
                 ], axis=-1) if _has_rgb else None
+                # Which SOURCE point each row came from. Carried through the
+                # z-clip below and used in step 6 to return per-point classes
+                # indexed to the file the caller has, not to our working array.
+                src_idx = _sel
             else:
                 xyz_all = np.stack([
                     np.asarray(las.x, dtype=np.float32),
@@ -346,6 +350,7 @@ def predict(req: AiAssistRequest):
                     np.asarray(las.green, dtype=np.float32),
                     np.asarray(las.blue, dtype=np.float32),
                 ], axis=-1) if _has_rgb else None
+                src_idx = np.arange(len(xyz_all), dtype=np.int64)
             # Free the laspy object on BOTH paths. It is not referenced again,
             # and everything below works off xyz_all/intensity_all/rgb_all.
             #
@@ -402,6 +407,11 @@ def predict(req: AiAssistRequest):
                 intensity_all = intensity_all[_keep]
                 if rgb_all is not None:
                     rgb_all = rgb_all[_keep]
+                # Keep the source mapping in step with the rows it describes;
+                # step 6 scatters predictions back through it. Dropping this
+                # would silently shift every per-point class by however many
+                # outliers were removed.
+                src_idx = src_idx[_keep]
                 n = len(xyz_all)
                 centroid = xyz_all.mean(axis=0)
                 print(f"[CLIP] dropped {_dropped:,} z-outliers "
@@ -503,6 +513,48 @@ def predict(req: AiAssistRequest):
             ov_cls = _dales_map[per_point[keep]]
             ov_rgb = rgb_all[keep] if rgb_all is not None else None
 
+            # 6b. FULL-RESOLUTION per-point classes, in SOURCE FILE ORDER.
+            #
+            # The sampled overlay above is ~4% of a 12.5M-point tile, and the
+            # export rebuilds the missing 96% with a nearest-neighbour
+            # propagation that amplifies every wrong sample ~25x (JLabel's
+            # suppress_implausible_objects records 315 Pole samples becoming
+            # 7,800 points that were 88.9% tree canopy). Returning the real
+            # per-point answer removes that step rather than tuning it.
+            #
+            # It is also SMALLER than the sample it replaces. Measured on
+            # M-34-63-A-b-2-4-4-1 (12,571,951 pts), gzipped as GZipMiddleware
+            # already does:
+            #
+            #     500k positions + classes (the overlay)   3.67 MB    4% of pts
+            #     per-class index runs (RLE), 100%         0.72 MB  100% of pts
+            #     uint8 per point + base64, 100%           0.27 MB  100% of pts
+            #
+            # uint8 wins because JSON spends ~7 bytes on every integer while a
+            # byte array spends one, and gzip handles the repetition better
+            # than RLE-in-JSON does. It also degrades more gracefully: these
+            # numbers come from a smoothed export, and rawer predictions mean
+            # more runs, which costs RLE far more than it costs gzip.
+            #
+            # Indexed to the SOURCE file, NOT to xyz_all: the SPT_HARD_CAP
+            # subsample and the z-outlier clip both drop rows, so src_idx is
+            # carried through both and used to scatter back here. Points that
+            # were dropped keep class 0, which JLabel already treats as
+            # unclassified -- so the array is always exactly as long as the
+            # caller's file, and alignment holds by construction rather than
+            # by assumption.
+            #
+            # The sampled overlay is still returned alongside this: the viewer
+            # renders from it, and older JLabel builds know nothing about
+            # classes_b64.
+            _t_pp = time.time()
+            per_point_src = np.zeros(_n_total, dtype=np.uint8)
+            per_point_src[src_idx] = _dales_map[per_point].astype(np.uint8)
+            _pp_b64 = base64.b64encode(per_point_src.tobytes()).decode()
+            print(f"[PERPOINT] {_n_total:,} pts, "
+                  f"{len(_pp_b64)/1e6:.1f} MB b64 pre-gzip, "
+                  f"{time.time()-_t_pp:.1f}s", flush=True)
+
             print(f"[OVERLAY] {len(keep):,} of {_n_all:,} pts "
                   f"(cap {_ov_cap:,}), rgb={ov_rgb is not None}", flush=True)
             _t_ser = time.time()
@@ -516,6 +568,13 @@ def predict(req: AiAssistRequest):
                 "classes": ov_cls.tolist(),
                 "rgb": ov_rgb.tolist() if ov_rgb is not None else None,
                 "instance_ids": [0] * len(ov_cls),
+                # Full-resolution per-point classes (see 6b). uint8 per point,
+                # base64, one entry per point of the SOURCE file in file order,
+                # so a client can index it directly against its own LAS with no
+                # spatial join. `n_points` is what that length must equal --
+                # check it before trusting the alignment.
+                "classes_b64": _pp_b64,
+                "n_points": int(_n_total),
                 "palette": {
                     "Other":       [80, 80, 80],
                     "Ground":      [243, 214, 171],
